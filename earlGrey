@@ -24,6 +24,7 @@ usage()
 		-e == Run HELIANO as an optional step to detect Helitrons (yes/no, Default: no)
 		-q == Suppress TEstrainer parallel progress bar (yes/no, Default: no, useful for batch/sbatch jobs)
 		-v == Validate resume by genome checksum: rerun a stage if the input genome changed since it last completed (yes/no, Default: no)
+		-M == Memory (MB) cap for cd-hit-est clustering (Default: auto-detect from SLURM/cgroup/system; 0 = unlimited). Overrides \$EARLGREY_CDHIT_MEM_MB
 		-h == Show help
 
 	Example Usage:
@@ -227,12 +228,72 @@ strainerResume() {
 	cp $latestFile ${OUTDIR}/${species}_strainer/
 }
 
+# Subprocess detectCdhitMem
+# Determine the memory cap (in MB) to pass to cd-hit-est -M.
+# cd-hit's own default of 800MB is too small for large libraries; instead size it
+# from the runtime environment. Priority:
+#   1. explicit -M flag ($cdhitMemMB) or $EARLGREY_CDHIT_MEM_MB env var (passed through verbatim)
+#   2. SLURM memory allocation (per-node, else per-cpu * cpus)
+#   3. cgroup memory limit (v2 memory.max, else v1 memory.limit_in_bytes)
+#   4. system MemAvailable (else MemTotal) from /proc/meminfo
+# For auto-detected values we use 80% of what is available to leave headroom for the
+# rest of the process. A result of 0 means "unlimited" (let cd-hit manage its own memory).
+detectCdhitMem()
+{
+	# 1. explicit override - honour it exactly as given (including 0 = unlimited)
+	if [ -n "$cdhitMemMB" ]; then
+		echo "$cdhitMemMB"; return
+	fi
+	if [ -n "$EARLGREY_CDHIT_MEM_MB" ]; then
+		echo "$EARLGREY_CDHIT_MEM_MB"; return
+	fi
+
+	local totalMB=""
+
+	# 2. SLURM allocation (values are already in MB)
+	if [ -n "$SLURM_MEM_PER_NODE" ]; then
+		totalMB=$SLURM_MEM_PER_NODE
+	elif [ -n "$SLURM_MEM_PER_CPU" ]; then
+		local ncpu=${SLURM_CPUS_PER_TASK:-${SLURM_JOB_CPUS_PER_NODE:-1}}
+		# SLURM_JOB_CPUS_PER_NODE can look like "16(x2)"; keep only the leading integer
+		ncpu=${ncpu%%[^0-9]*}; [ -z "$ncpu" ] && ncpu=1
+		totalMB=$(( SLURM_MEM_PER_CPU * ncpu ))
+	fi
+
+	# 3. cgroup limit (bytes -> MB; huge sentinel values mean unlimited, so ignore them)
+	if [ -z "$totalMB" ]; then
+		if [ -r /sys/fs/cgroup/memory.max ]; then
+			local m; m=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+			[ "$m" != "max" ] && [ ${#m} -le 15 ] && totalMB=$(( m / 1024 / 1024 ))
+		elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+			local m; m=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+			[ -n "$m" ] && [ ${#m} -le 15 ] && totalMB=$(( m / 1024 / 1024 ))
+		fi
+	fi
+
+	# 4. fall back to system memory
+	if [ -z "$totalMB" ]; then
+		local kb; kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+		[ -z "$kb" ] && kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+		[ -n "$kb" ] && totalMB=$(( kb / 1024 ))
+	fi
+
+	if [ -z "$totalMB" ] || [ "$totalMB" -le 0 ] 2>/dev/null; then
+		echo "0"; return   # nothing detectable - let cd-hit run unlimited
+	fi
+
+	# use 80% of the detected memory, leaving headroom
+	echo $(( totalMB * 80 / 100 ))
+}
+
 # Subprocess clust
 # optional wicker clustering of TE library consensus sequences to reduce redundancy
 clust()
 {
 	cd ${OUTDIR}/${species}_strainer/
-	cd-hit-est -d 0 -aS 0.8 -c 0.8 -G 0 -g 1 -b 500 -r 1 -i $latestFile -o ${latestFile}.clstrd.fa -T ${ProcNum}
+	local cdhitMem; cdhitMem=$(detectCdhitMem)
+	echo "Running cd-hit-est with memory cap -M ${cdhitMem} MB (0 = unlimited)"
+	cd-hit-est -d 0 -aS 0.8 -c 0.8 -G 0 -g 1 -b 500 -r 1 -M ${cdhitMem} -i $latestFile -o ${latestFile}.clstrd.fa -T ${ProcNum}
 	latestFile=$latestFile.clstrd.fa
 }
 
@@ -592,7 +653,7 @@ dfamCheck()
 
 # Main #
 
-while getopts g:s:o:t:f:i:r:c:l:m:d:n:a:e:q:v:h option
+while getopts g:s:o:t:f:i:r:c:l:m:d:n:a:e:q:v:M:h option
 do
 	case "${option}"
 		in
@@ -612,6 +673,7 @@ do
 		e) heli=${OPTARG};;
 		q) quietBar=${OPTARG};;
 		v) checksumResume=${OPTARG};;
+		M) cdhitMemMB=${OPTARG};;
 		h) usage; exit 0;;
 	esac
 done

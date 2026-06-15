@@ -102,6 +102,27 @@ drop output. These are now fixed:
   directory and does not auto-clear prior outputs, so for a changed genome a fresh
   output directory remains the safest choice.
 
+## New feature — environment-aware cd-hit-est memory cap (`earlGrey`)
+
+- **`-M <MB>` (default: auto-detect; `0` = unlimited).** The optional library
+  clustering step (`-c yes`) runs `cd-hit-est`, whose built-in memory cap of
+  800 MB is too small for large TE libraries and forces excessive flushing. The
+  cap is now sized from the runtime environment by a new `detectCdhitMem()`
+  helper and passed via `cd-hit-est -M`. Resolution order:
+  1. explicit `-M` flag, else the `$EARLGREY_CDHIT_MEM_MB` env var — passed
+     through verbatim (including `0` for unlimited);
+  2. SLURM allocation — `$SLURM_MEM_PER_NODE`, else
+     `$SLURM_MEM_PER_CPU × cpus` (`$SLURM_CPUS_PER_TASK`/`$SLURM_JOB_CPUS_PER_NODE`,
+     tolerating the `16(x2)` format);
+  3. cgroup limit — v2 `memory.max`, else v1 `memory.limit_in_bytes`
+     (the oversized "unlimited" sentinel values are ignored);
+  4. system memory from `/proc/meminfo` (`MemAvailable`, else `MemTotal`).
+- **80% headroom and safe fallback.** Auto-detected values use 80% of the
+  available memory to leave room for the rest of the process; if nothing is
+  detectable the helper emits `0` (let cd-hit manage its own memory) rather than
+  falling back to the cramped 800 MB default. The chosen cap is logged before
+  `cd-hit-est` runs.
+
 ## Bug fixes — TEstrainer directory selection (`earlGrey`, `earlGreyLibConstruct`)
 
 The `strainer()` and `strainerResume()` subprocesses locate the TEstrainer output
